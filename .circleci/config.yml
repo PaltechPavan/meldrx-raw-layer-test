@@ -4,17 +4,35 @@ jobs:
   build-and-push:
     docker:
       - image: cimg/base:stable
+    environment:
+      AWS_REGION: ap-south-1
+      ECR_REPOSITORY: meldrx-test-ingest
     steps:
       - checkout
       - setup_remote_docker
       - run:
+          name: Install AWS CLI and Docker tools
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y awscli docker.io
+      - run:
+          name: Authenticate to AWS using CircleCI OIDC
+          command: |
+            set -e
+            echo "OIDC authentication will be configured using the CircleCI job token."
+            test -n "${AWS_ROLE_ARN}" || {
+              echo "AWS_ROLE_ARN is missing from the meldrx-test context."
+              exit 1
+            }
+            echo "AWS role ARN is configured."
+      - run:
           name: Build and push MeldRx image
           command: |
-            echo "CircleCI configuration is ready."
-            echo "AWS OIDC authentication and ECR build/push will be configured next."
+            echo "Docker build and ECR push will be enabled after OIDC authentication is configured."
 
 workflows:
   meldrx-test-pipeline:
     jobs:
-      - build-and-push
+      - build-and-push:
+          context: meldrx-test
 

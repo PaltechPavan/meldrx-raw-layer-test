@@ -1,0 +1,20 @@
+version: 2.1
+
+jobs:
+  build-and-push:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push MeldRx image
+          command: |
+            echo "CircleCI configuration is ready."
+            echo "AWS OIDC authentication and ECR build/push will be configured next."
+
+workflows:
+  meldrx-test-pipeline:
+    jobs:
+      - build-and-push
+

@@ -53,7 +53,7 @@ class Ingest:
         self.glue = glue or boto3.client("glue")
         self.tables, self.partitions = set(), set()
         self.stats = {"new_versions": 0, "files_loaded": 0, "entries": {}, "quarantined": 0,
-                      "deletions": 0, "failed": 0, "per_file": []}
+                      "deletions": 0, "resource_files_deleted": 0, "failed": 0, "per_file": []}
 
     # ---------- S3 helpers
     def _keys(self, bucket, prefix):
@@ -65,6 +65,39 @@ class Ingest:
     def _put(self, key, body, metadata=None):
         self.s3.put_object(Bucket=self.raw_bucket, Key=key, Body=body, ServerSideEncryption="aws:kms",
                            SSEKMSKeyId=self.kms, ContentType="application/json", Metadata=metadata or {})
+
+    def _delete_resource_files_for_source_versions(self, participant, fname, source_key, deleted_at):
+        """Delete derived resource objects for source versions that existed at deletion time.
+
+        Resource object names end with {participant}__{fname}__{source_version_id}.json.
+        Restrict deletion to versions whose LastModified is at or before this delete marker,
+        so a later re-upload of the same source filename is not removed by an older marker.
+        Landing copies are deliberately retained as the immutable audit/source history.
+        """
+        source_version_ids = set()
+        for page in self.s3.get_paginator("list_object_versions").paginate(
+                Bucket=self.src_bucket, Prefix=source_key):
+            for version in page.get("Versions", []):
+                if (version["Key"] == source_key
+                        and version["LastModified"] <= deleted_at
+                        and version["VersionId"] != "null"):
+                    source_version_ids.add(version["VersionId"])
+
+        if not source_version_ids:
+            return 0
+
+        resource_prefix = self.raw_prefix + "resources/"
+        deleted_count = 0
+        for key in self._keys(self.raw_bucket, resource_prefix):
+            basename = key.rsplit("/", 1)[-1]
+            for version_id in source_version_ids:
+                expected_name = f"{participant}__{fname}__{version_id}.json"
+                if basename == expected_name:
+                    self.s3.delete_object(Bucket=self.raw_bucket, Key=key)
+                    deleted_count += 1
+                    break
+        self.stats["resource_files_deleted"] += deleted_count
+        return deleted_count
 
     # ---------- Glue helpers (no crawler)
     def _storage(self, location):
@@ -193,10 +226,21 @@ class Ingest:
             return
         participant, fname = self.names(m["Key"])
         key = f"{self.raw_prefix}deletions/{participant}/{fname}__{m['VersionId']}.json"
+
+        # Delete resource-specific copies for source versions that existed before this
+        # delete marker. This also repairs markers recorded by older runs that did not
+        # remove the resource-specific objects. Newer re-uploads are left untouched.
+        deleted_count = self._delete_resource_files_for_source_versions(
+            participant, fname, m["Key"], m["LastModified"])
+        log("resource_files_deleted_for_source_deletion", source_file=m["Key"],
+            delete_marker_version_id=m["VersionId"], resource_files_deleted=deleted_count)
+
+        # Keep the existing deletion audit record behavior; do not create duplicates.
         if key in deletions:
             return
         self._put(key, json.dumps({"source_file": m["Key"], "delete_marker_version_id": m["VersionId"],
-                                   "deleted_at": m["LastModified"].isoformat()}).encode("utf-8"))
+                                   "deleted_at": m["LastModified"].isoformat(),
+                                   "resource_files_deleted": deleted_count}).encode("utf-8"))
         self.stats["deletions"] += 1
         log("deletion_recorded", key=m["Key"], delete_marker_version_id=m["VersionId"])
 
